@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
@@ -15,63 +16,152 @@ import (
 )
 
 const (
+	DefaultPort    int    = 20000
 	TimeoutSeconds int    = 10
 	AdminDbName    string = "admin"
 	DefaultURI     string = "mongodb://localhost:27017"
 )
 
-// connect to the mongo database, log.Fatal on error
-func connect(uri string, timeout time.Duration) *mongo.Client {
+// connect to the mongo database.
+func connect(uri string, timeout time.Duration) (*mongo.Client, error) {
 	ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
 	defer cancelFunc()
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {
-		log.Fatal("Failed to connect to mongo: ", err)
+		return nil, fmt.Errorf("connection error: %w", err)
 	}
-	return client
+	return client, nil
 }
 
-// get replication status, log.Fatal on error
-func getRsStatus(client *mongo.Client, admindb string, timeout time.Duration) *mongo.SingleResult {
+// get replication status
+func getRsStatus(client *mongo.Client, admindb string, timeout time.Duration) (*mongo.SingleResult, error) {
 	ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
 	defer cancelFunc()
 	result := client.Database(admindb).RunCommand(ctx, bson.D{{"replSetGetStatus", 1}})
 	if err := result.Err(); err != nil {
-		log.Fatal("Failed to run replSetGetStatus: ", err)
+		return nil, fmt.Errorf("replSetGetStatus error: %w", err)
 	}
-	return result
+	return result, nil
 }
 
-// Initiate the replicaset, if not already initiated
-func rsInitiate(client *mongo.Client, admindb string, document []byte, timeout time.Duration) *mongo.SingleResult {
+// Initiate the replicaset
+func rsInitiate(client *mongo.Client, admindb string, document []byte, timeout time.Duration) (*mongo.SingleResult, error) {
 	ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
 	defer cancelFunc()
 	var command bson.D
 	if err := bson.UnmarshalExtJSON(document, true, &command); err != nil {
-		log.Fatal("failed to parse replicaSet document: ", err)
+		return nil, fmt.Errorf("unmarshal error: %w", err)
 	}
 	result := client.Database(admindb).RunCommand(ctx, bson.D{{"replSetInitiate", command}})
 	if err := result.Err(); err != nil {
-		log.Fatal("Failed to run replSetGetStatus: ", err)
+		return nil, fmt.Errorf("replSetInitiate error: %w")
 	}
-	return result
+	return result, nil
+}
+
+// dump a mongo.SingleResult to json
+func singleResultJson(result *mongo.SingleResult) ([]byte, error) {
+	raw, err := result.Raw()
+	if err != nil {
+		return nil, fmt.Errorf("raw error: %w", err)
+	}
+	str, err := bson.MarshalExtJSONIndent(raw, false, false, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal error: %w", err)
+	}
+	return str, nil
+}
+
+// HTTP Request handler
+type handler struct {
+	Timeout time.Duration
+	AdminDb string
+	URI     string
+}
+
+// GET request: return replicaSet status
+func (h *handler) GET(w http.ResponseWriter, r *http.Request) (*mongo.SingleResult, error) {
+	client, err := connect(h.URI, h.Timeout)
+	if err != nil {
+		return nil, err
+	}
+	return getRsStatus(client, h.AdminDb, h.Timeout)
+}
+
+// POST request: initiate a replicaSet
+func (h *handler) POST(w http.ResponseWriter, r *http.Request) (*mongo.SingleResult, error) {
+	client, err := connect(h.URI, h.Timeout)
+	if err != nil {
+		return nil, err
+	}
+	initiateDoc, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read body error: %w", err)
+	}
+	return rsInitiate(client, h.AdminDb, initiateDoc, h.Timeout)
+}
+
+// serve HTTP requests
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// exhaust the request body on return
+	defer func() {
+		if r.Body != nil {
+			io.Copy(io.Discard, r.Body)
+			r.Body.Close()
+		}
+	}()
+	// Manage HTTP method (GET, POST, others)
+	var (
+		result *mongo.SingleResult
+		err    error
+	)
+	switch r.Method {
+	case http.MethodGet:
+		result, err = h.GET(w, r)
+	case http.MethodPost:
+		contentType := r.Header.Get("Content-Type")
+		if contentType != "application/json" {
+			http.Error(w, fmt.Sprintf("unsupported content type %s", contentType), http.StatusUnsupportedMediaType)
+			return
+		}
+		result, err = h.POST(w, r)
+	default:
+		http.Error(w, fmt.Sprintf("unsupported method %s", r.Method), http.StatusMethodNotAllowed)
+		return
+	}
+	// If no error while handling, encode result
+	str, err := singleResultJson(result)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Else, return json response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	n, err := w.Write(str)
+	if err != nil {
+		log.Printf("failed to serve request after %d bytes: %s", n, err)
+	}
 }
 
 // parse flags and return replication status
 func main() {
 	var (
-		timeoutFlag  int
-		adminDbFlag  string
-		uriDbFlag    string
-		initiateFlag string
+		portFlag    int
+		timeoutFlag int
+		uriDbFlag   string
+		adminDbFlag string
 	)
 
+	flag.IntVar(&portFlag, "port", DefaultPort, "HTTP port to listen on")
 	flag.IntVar(&timeoutFlag, "timeout", TimeoutSeconds, "timeout for calls to mongodb")
 	flag.StringVar(&adminDbFlag, "admindb", AdminDbName, "name of the admin db")
 	flag.StringVar(&uriDbFlag, "uri", "", "mongo URI")
-	flag.StringVar(&initiateFlag, "initiate", "", "initiate replicaset")
 	flag.Parse()
 
+	if portFlag <= 1024 || portFlag >= 65536 {
+		log.Fatal("allowed port values are between 1025 and 65535")
+	}
 	if timeoutFlag < 1 || timeoutFlag > 1800 {
 		log.Fatal("allowed timeout values are between 1 and 1800 seconds")
 	}
@@ -86,45 +176,17 @@ func main() {
 	}
 
 	timeoutDuration := time.Duration(timeoutFlag) * time.Second
-	client := connect(uriDbFlag, timeoutDuration)
-	defer func() {
-		ctx, cancelFunc := context.WithTimeout(context.Background(), timeoutDuration)
-		defer cancelFunc()
-		if err := client.Disconnect(ctx); err != nil {
-			log.Fatal("failed to disconnect from mongo: ", err)
-		}
-	}()
-	result := getRsStatus(client, adminDbFlag, timeoutDuration)
-
-	// if initiateFlag != "", initialize the replicaSet with the given document
-	if initiateFlag != "" {
-		var reader io.Reader
-		if initiateFlag == "-" {
-			// Read initiation doc from stdin
-			fmt.Fprint(os.Stderr, "reading replicaSet config document from stdin")
-			reader = os.Stdin
-		} else {
-			file, err := os.Open(initiateFlag)
-			if err != nil {
-				log.Fatal("failed to open replicaSet config document: ", err)
-			}
-			defer file.Close()
-			reader = file
-		}
-		initiateDoc, err := io.ReadAll(reader)
-		if err != nil {
-			log.Fatal("failed to read replicaSet config document: ", err)
-		}
-		result = rsInitiate(client, adminDbFlag, initiateDoc, timeoutDuration)
+	server := http.Server{
+		Addr: fmt.Sprintf(":%d", portFlag),
+		Handler: &handler{
+			Timeout: timeoutDuration,
+			AdminDb: adminDbFlag,
+			URI:     uriDbFlag,
+		},
+		ReadTimeout:  3 * timeoutDuration,
+		WriteTimeout: 3 * timeoutDuration,
+		IdleTimeout:  3 * timeoutDuration,
 	}
-
-	raw, err := result.Raw()
-	if err != nil {
-		log.Fatal("failed to decode result: ", err)
-	}
-	str, err := bson.MarshalExtJSONIndent(raw, false, false, "", "  ")
-	if err != nil {
-		log.Fatal("failed to marshal result: ", err)
-	}
-	fmt.Printf("%s\n", string(str))
+	fmt.Printf("Listening at port %d", portFlag)
+	panic(server.ListenAndServe())
 }
