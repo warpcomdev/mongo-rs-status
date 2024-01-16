@@ -94,10 +94,12 @@ func main() {
 			log.Fatal("failed to disconnect from mongo: ", err)
 		}
 	}()
-	result := getRsStatus(client, adminDbFlag, timeoutDuration)
+	var result *mongo.SingleResult
 
-	// if initiateFlag != "", initialize the replicaSet with the given document
-	if initiateFlag != "" {
+	if initiateFlag == "" {
+		result = getRsStatus(client, adminDbFlag, timeoutDuration)
+	} else {
+		// if initiateFlag != "", initialize the replicaSet with the given document
 		var reader io.Reader
 		if initiateFlag == "-" {
 			// Read initiation doc from stdin
