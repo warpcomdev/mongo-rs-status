@@ -80,32 +80,6 @@ func singleResultJson(result *mongo.SingleResult) ([]byte, error) {
 	return str, nil
 }
 
-// HttpError is an error that includes HTTP Status Code
-type HttpError interface {
-	error
-	Code() int
-}
-
-type httpError struct {
-	err  error
-	code int
-}
-
-// Error implements Error
-func (e httpError) Error() string {
-	return e.err.Error()
-}
-
-// Unwrap implements Unwrap
-func (e httpError) Unwrap() error {
-	return e.err
-}
-
-// Code implements Code
-func (e httpError) Code() int {
-	return e.code
-}
-
 // HTTP Request handler
 type handler struct {
 	ClientMutex sync.Mutex
@@ -141,16 +115,6 @@ func (h *handler) releaseClient(client *mongo.Client) {
 	disconnect(client, h.Timeout)
 }
 
-// writeError writes an error message to the writer
-func writeError(w http.ResponseWriter, err error, code int) {
-	if codeProvider, ok := err.(HttpError); ok {
-		code = codeProvider.Code()
-	}
-	if err != nil {
-		http.Error(w, err.Error(), code)
-	}
-}
-
 // serve HTTP requests
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// exhaust the request body on return
@@ -163,23 +127,27 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Get a client connection
 	client, err := h.acquireClient()
 	if err != nil {
-		writeError(w, err, http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	// Manage HTTP method (GET, POST, others)
-	var result []byte
+	var (
+		code   int
+		result []byte
+	)
 	switch r.Method {
 	case http.MethodGet:
-		result, err = h.GET(client, w, r)
+		code, result, err = h.GET(client, w, r)
 	default:
-		err = httpError{err: fmt.Errorf("unsupported method %s", r.Method), code: http.StatusMethodNotAllowed}
+		code = http.StatusMethodNotAllowed
+		err = fmt.Errorf("unsupported method %s", r.Method)
 	}
 	if err != nil {
-		writeError(w, err, http.StatusInternalServerError)
+		http.Error(w, err.Error(), code)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(code)
 	n, err := w.Write(result)
 	if err != nil {
 		log.Printf("failed to serve request after %d bytes: %s", n, err)
@@ -187,14 +155,18 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET request: return replicaSet status
-func (h *handler) GET(client *mongo.Client, w http.ResponseWriter, r *http.Request) ([]byte, error) {
+func (h *handler) GET(client *mongo.Client, w http.ResponseWriter, r *http.Request) (int, []byte, error) {
 	result, err := getRsStatus(client, h.AdminDb, h.Timeout)
 	if err != nil {
 		// Release client which might be failed
 		h.releaseClient(client)
-		return nil, fmt.Errorf("GET::getRsStatus: %w", err)
+		return http.StatusInternalServerError, nil, fmt.Errorf("GET::getRsStatus: %w", err)
 	}
-	return singleResultJson(result)
+	data, err := singleResultJson(result)
+	if err != nil {
+		return http.StatusInternalServerError, nil, fmt.Errorf("GET::singleResultJson: %w", err)
+	}
+	return http.StatusOK, data, err
 }
 
 // parse flags and return replication status
